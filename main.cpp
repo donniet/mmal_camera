@@ -37,20 +37,6 @@ struct mmal_unique_ptr<MMAL_COMPONENT_T> :
     }
 };
 
-struct mmal_connection_enabled {
-    MMAL_CONNECTION_T * p;
-
-    mmal_connection_enabled(MMAL_CONNECTION_T * p) : p(p) {
-        std::cerr << "enabling connection" << std::endl;
-        if (mmal_connection_enable(p) != MMAL_SUCCESS) {
-            throw std::logic_error("failed to enable connection");
-        }
-    }
-    ~mmal_connection_enabled() {
-        mmal_connection_disable(p);
-    }
-};
-
 template<> 
 struct mmal_unique_ptr<MMAL_CONNECTION_T> : 
     public mmal_unique_ptr_base<MMAL_CONNECTION_T>
@@ -65,9 +51,53 @@ struct mmal_unique_ptr<MMAL_CONNECTION_T> :
     }
 };
 
-class Camera {
+struct mmal_connection_enabled {
+    MMAL_CONNECTION_T * p;
+
+    mmal_connection_enabled(MMAL_CONNECTION_T * p) : p(p) {
+        std::cerr << "enabling connection" << std::endl;
+        if (mmal_connection_enable(p) != MMAL_SUCCESS) {
+            throw std::logic_error("failed to enable connection");
+        }
+    }
+    ~mmal_connection_enabled() {
+        mmal_connection_disable(p);
+    }
+};
+
+struct component_enabler {
 private:
+    MMAL_COMPONENT_T * comp;
+public:
+    component_enabler(component_enabler const &) = delete;
+    component_enabler(component_enabler && rhs) {
+        comp = rhs.comp;
+        rhs.comp = nullptr;
+    }
+    component_enabler(MMAL_COMPONENT_T * comp) : comp(comp) {
+        MMAL_STATUS_T status = mmal_component_enable(comp);
+        if (status != MMAL_SUCCESS) throw std::logic_error("could not enable component");
+    }
+    ~component_enabler() {
+        if (comp != nullptr) mmal_component_disable(comp);
+    }
+};
+
+class Component {
+    friend struct component_enabler;
+protected:
     mmal_unique_ptr<MMAL_COMPONENT_T> comp;
+
+    Component(std::string const & name) : comp(name) {}
+
+public:
+    component_enabler enable_scoped() {
+        return component_enabler(comp);
+    }
+};
+
+class Camera : public Component {
+private:
     uint32_t width;
     uint32_t height;
     float fps;
@@ -108,7 +138,7 @@ private:
 
 public:
     Camera(uint32_t w, uint32_t h, float fps, int num = 0) : 
-        comp(MMAL_COMPONENT_DEFAULT_CAMERA), width(w), height(h), fps(fps), num(num) {
+        Component(MMAL_COMPONENT_DEFAULT_CAMERA), width(w), height(h), fps(fps), num(num) {
         MMAL_PARAMETER_INT32_T camera_num = {
             {MMAL_PARAMETER_CAMERA_NUM, sizeof(camera_num)},
             num
@@ -194,9 +224,8 @@ public:
     }
 };
 
-class Encoder {
+class Encoder : public Component {
 private:
-    mmal_unique_ptr<MMAL_COMPONENT_T> comp;
     uint32_t bitrate;
     MMAL_POOL_T * pool;
 
@@ -205,7 +234,7 @@ private:
         mmal_buffer_header_release(buffer);
     }
 public:
-    Encoder(uint32_t bitrate = 25000000) : comp(MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER), bitrate(bitrate) {
+    Encoder(uint32_t bitrate = 25000000) : Component(MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER), bitrate(bitrate) {
         MMAL_STATUS_T status;
         MMAL_PORT_T * in, * out;
 
@@ -245,11 +274,11 @@ public:
         // set motion vectors
         // set refresh type
 
-        status = mmal_component_enable(comp);
-        if (status != MMAL_SUCCESS) throw std::logic_error("could not enable video_encoder");
+        // status = mmal_component_enable(comp);
+        // if (status != MMAL_SUCCESS) throw std::logic_error("could not enable video_encoder");
 
-        pool = mmal_port_pool_create(out, out->buffer_num, out->buffer_size); 
-        if (pool == NULL) throw std::logic_error("could not create output pool");     
+        // pool = mmal_port_pool_create(out, out->buffer_num, out->buffer_size); 
+        // if (pool == NULL) throw std::logic_error("could not create output pool");     
     }
 
     MMAL_PORT_T * input() { return comp->input[0]; }
@@ -284,6 +313,8 @@ private:
     static void control_callback(MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T *buffer) {
         Context * ctx = reinterpret_cast<Context*>(port->userdata);
 
+        std::cerr << "control callback" << std::endl;
+
         if (buffer->cmd == MMAL_EVENT_ERROR) {
             ctx->status = *(MMAL_STATUS_T*)buffer->data;
         } else if (buffer->cmd == MMAL_EVENT_EOS) {
@@ -297,6 +328,8 @@ private:
 
     static void connection_callback(MMAL_CONNECTION_T * c) {
         Context * ctx = reinterpret_cast<Context*>(c->user_data);
+
+        std::cerr << "connection callback" << std::endl;
 
         ctx->ready.notify_all();
     }
@@ -338,17 +371,11 @@ private:
 
         return true;
     }
-
-    void processing_loop() {
-        mmal_connection_enabled enabled(camera_to_video_encoder);
-
-        while(processing_step()) { }
-    }
 public:
     Context() : 
         camera(1440, 1080, 25, 0),
         video_encoder(),
-        camera_to_video_encoder(video_encoder.input(), camera.preview_port()),
+        camera_to_video_encoder(video_encoder.input(), camera.preview_port(), MMAL_CONNECTION_FLAG_TUNNELLING | MMAL_CONNECTION_FLAG_ALLOCATION_ON_INPUT),
         status(MMAL_SUCCESS),
         eos(false)
     { 
@@ -361,12 +388,23 @@ public:
 
         status = mmal_port_enable(video_encoder.output(), output_callback);
         if (status != MMAL_SUCCESS) throw std::logic_error("could not enable encoder output port");
+
+        // status = mmal_port_enable(camera.preview_port(), output_callback);
+        // if (status != MMAL_SUCCESS) throw std::logic_error("could not enable preview port");
     }
 
     void start() { 
         std::cerr << "starting..." << std::endl;
 
-        processing_loop(); 
+        MMAL_STATUS_T status;
+        status = mmal_port_parameter_set_boolean(camera.video_port(), MMAL_PARAMETER_CAPTURE, true);
+        if (status != MMAL_SUCCESS) std::logic_error("error starting capture");
+
+        mmal_connection_enabled enabled(camera_to_video_encoder);
+        auto camera_enabled = camera.enable_scoped();
+        auto encder_enabled = video_encoder.enable_scoped();
+
+        while(processing_step()) { }
     }
 
     void stop() {
