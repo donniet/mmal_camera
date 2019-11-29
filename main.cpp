@@ -215,6 +215,10 @@ public:
         format->es->video.frame_rate.num = int32_t(fps * 1000);
         format->es->video.frame_rate.den = 1000;
 
+        std::cerr << "format: " << format->es->video.width << "x" << format->es->video.height << std::endl;
+
+        mmal_log_dump_format(format);
+
         MMAL_STATUS_T status;
 
         status = mmal_port_format_commit(preview_port());
@@ -250,7 +254,7 @@ private:
         mmal_buffer_header_release(buffer);
     }
 public:
-    Encoder(uint32_t bitrate = 25000000) : Component(MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER), bitrate(bitrate) {
+    Encoder(uint32_t width, uint32_t height, float fps, uint32_t bitrate = 25000000) : Component(MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER), bitrate(bitrate) {
         MMAL_STATUS_T status;
         MMAL_PORT_T * in, * out;
 
@@ -267,6 +271,15 @@ public:
 
         mmal_format_copy(out->format, in->format);
 
+
+        out->format->es->video.width = VCOS_ALIGN_UP(width, 32);
+        out->format->es->video.height = VCOS_ALIGN_UP(height, 16);
+        out->format->es->video.crop.x = 0;
+        out->format->es->video.crop.y = 0;
+        out->format->es->video.crop.width = width;
+        out->format->es->video.crop.height = height;
+        // out->format->es->video.frame_rate.num = int32_t(fps * 1000);
+        // out->format->es->video.frame_rate.den = 1000;
         out->format->encoding = MMAL_ENCODING_H264;
         out->format->bitrate = bitrate;
         out->buffer_size = out->buffer_num_recommended;
@@ -274,9 +287,28 @@ public:
         out->format->es->video.frame_rate.num = 0;
         out->format->es->video.frame_rate.den = 1;
 
+        std::cerr << "format: " << out->format->es->video.width << "x" << out->format->es->video.height << std::endl;
+
+
+        mmal_log_dump_format(out->format);
+
         status = mmal_port_format_commit(out);
         if (status != MMAL_SUCCESS) throw std::logic_error("unable to set format on encoder output port");
 
+        in->format->es->video.width = VCOS_ALIGN_UP(width, 32);
+        in->format->es->video.height = VCOS_ALIGN_UP(height, 16);
+        in->format->es->video.crop.x = 0;
+        in->format->es->video.crop.y = 0;
+        in->format->es->video.crop.width = width;
+        in->format->es->video.crop.height = height;
+        // in->format->es->video.frame_rate.num = int32_t(fps * 1000);
+        // in->format->es->video.frame_rate.den = 1000;
+
+        status = mmal_port_format_commit(in);
+        if (status != MMAL_SUCCESS) throw std::logic_error("unable to set format on encoder input port");
+
+        
+    
         // set slices
         // set quantization
         // set level
@@ -337,6 +369,10 @@ private:
     Encoder video_encoder;
     mmal_unique_ptr<MMAL_CONNECTION_T> camera_to_video_encoder;
 
+    MMAL_QUEUE_T * output_queue;
+
+    FILE * output_file;
+
     MMAL_STATUS_T status;
     bool eos;
 
@@ -344,12 +380,11 @@ private:
         Context * ctx = reinterpret_cast<Context*>(port->userdata);
 
         std::cerr << "output callback" << std::endl;
-        // mmal_queue_put(ctx->queue, buffer);
+        mmal_queue_put(ctx->output_queue, buffer);
 
+        // mmal_buffer_header_release(buffer);
         
-        mmal_buffer_header_release(buffer);
-        
-        ctx->video_encoder.send_buffer();
+        // ctx->video_encoder.send_buffer();
 
         ctx->ready.notify_all();
     }
@@ -397,28 +432,27 @@ private:
         }
         if (eos) return false;
 
-        // MMAL_BUFFER_HEADER_T * buf;
-        // MMAL_STATUS_T status;
+        MMAL_BUFFER_HEADER_T * buffer;
 
-        // if (!(camera_to_video_encoder->flags & MMAL_CONNECTION_FLAG_TUNNELLING)) {
-        //     while((buf = mmal_queue_get(camera_to_video_encoder->pool->queue)) != nullptr) {
-        //         status = mmal_port_send_buffer(camera_to_video_encoder->out, buf);
-        //         if (status != MMAL_SUCCESS) throw std::logic_error("failed to send buffer");
-        //     }
+        buffer = mmal_queue_get(output_queue);
 
-        //     while((buf = mmal_queue_get(camera_to_video_encoder->queue)) != nullptr) {
-        //         status = mmal_port_send_buffer(camera_to_video_encoder->in, buf);
-        //         if (status != MMAL_SUCCESS) throw std::logic_error("failed to queue buffer");
-        //     }
-        // }
+        if (buffer != nullptr) {
+            std::cerr << "got output buffer" << std::endl;
 
+            mmal_buffer_header_mem_lock(buffer);
+            fwrite(buffer->data, 1, buffer->length, output_file);
+            mmal_buffer_header_mem_unlock(buffer);
+
+            mmal_buffer_header_release(buffer);
+            video_encoder.send_buffer();
+        }
 
         return true;
     }
 public:
     Context() : 
         camera(1440, 1080, 25, 0),
-        video_encoder(),
+        video_encoder(1440, 1080, 25),
         camera_to_video_encoder(video_encoder.input(), camera.preview_port(), MMAL_CONNECTION_FLAG_TUNNELLING | MMAL_CONNECTION_FLAG_ALLOCATION_ON_INPUT),
         status(MMAL_SUCCESS),
         eos(false)
@@ -426,6 +460,9 @@ public:
         MMAL_STATUS_T status;
         // MMAL_PORT_T * encoder_input = video_encoder.input();
 
+        output_file = fopen("test.h264", "w");
+
+        output_queue = mmal_queue_create();
 
         camera_to_video_encoder->user_data = (void*)this;
         camera_to_video_encoder->callback = connection_callback;
@@ -457,6 +494,9 @@ public:
     }
 
     ~Context() {
+        mmal_queue_destroy(output_queue);
+        fflush(output_file);
+        fclose(output_file);
     }
 };
 
