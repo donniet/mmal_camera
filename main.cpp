@@ -65,23 +65,24 @@ struct mmal_connection_enabled {
     }
 };
 
-struct component_enabler {
-private:
-    MMAL_COMPONENT_T * comp;
-public:
-    component_enabler(component_enabler const &) = delete;
-    component_enabler(component_enabler && rhs) {
-        comp = rhs.comp;
-        rhs.comp = nullptr;
+template<typename T>
+struct enabler {
+    T * p;
+
+    enabler(enabler<T> const &) = delete;
+    enabler(enabler<T> && rhs) {
+        p = rhs.p;
+        rhs.p = nullptr;
     }
-    component_enabler(MMAL_COMPONENT_T * comp) : comp(comp) {
-        MMAL_STATUS_T status = mmal_component_enable(comp);
-        if (status != MMAL_SUCCESS) throw std::logic_error("could not enable component");
-    }
-    ~component_enabler() {
-        if (comp != nullptr) mmal_component_disable(comp);
+    enabler(T & x) : p(&x) {
+        if (!p->enable()) throw std::logic_error("could not enable");
+    } 
+    ~enabler() {
+        if (p != nullptr) p->disable();
     }
 };
+
+template<typename T> enabler<T> make_enabler(T & x) { return enabler<T>(x); }
 
 class Component {
     friend struct component_enabler;
@@ -91,8 +92,12 @@ protected:
     Component(std::string const & name) : comp(name) {}
 
 public:
-    component_enabler enable_scoped() {
-        return component_enabler(comp);
+    bool enable() {
+        return mmal_component_enable(comp) == MMAL_SUCCESS;
+    }
+
+    bool disable() {
+        return mmal_component_disable(comp) == MMAL_SUCCESS;
     }
 };
 
@@ -138,19 +143,23 @@ private:
 
 public:
     Camera(uint32_t w, uint32_t h, float fps, int num = 0) : 
-        Component(MMAL_COMPONENT_DEFAULT_CAMERA), width(w), height(h), fps(fps), num(num) {
+        Component(MMAL_COMPONENT_DEFAULT_CAMERA), width(w), height(h), fps(fps), num(num) 
+    {
+        std::cerr << "camera constructor" << std::endl;
+
         MMAL_PARAMETER_INT32_T camera_num = {
             {MMAL_PARAMETER_CAMERA_NUM, sizeof(camera_num)},
             num
         };
 
         MMAL_STATUS_T status;
+        status = mmal_port_enable(comp->control, camera_control_callback);
+        if (status != MMAL_SUCCESS) throw std::logic_error("could not enable camera control port");
 
         status = mmal_port_parameter_set(comp->control, &camera_num.hdr);
         if (status != MMAL_SUCCESS) throw std::logic_error("could not set camera number");
         if (comp->output_num == 0) throw std::logic_error("camera has no outputs");
 
-        status = mmal_port_enable(comp->control, camera_control_callback);
 
         check_camera_model();
         configure(w, h, fps);
@@ -210,6 +219,11 @@ public:
 
         status = mmal_port_format_commit(preview_port());
         if (status != MMAL_SUCCESS) throw std::logic_error("could not commit preview port format");
+
+        mmal_format_copy(video_port()->format, format);
+
+        status = mmal_port_format_commit(video_port());
+        if (status != MMAL_SUCCESS) throw std::logic_error("could not commit video port format");
         
     }
 
@@ -231,6 +245,8 @@ private:
 
 
     static void control_callback(MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer) {
+        std::cerr << "encoder control callback" << std::endl;
+
         mmal_buffer_header_release(buffer);
     }
 public:
@@ -277,8 +293,31 @@ public:
         // status = mmal_component_enable(comp);
         // if (status != MMAL_SUCCESS) throw std::logic_error("could not enable video_encoder");
 
-        // pool = mmal_port_pool_create(out, out->buffer_num, out->buffer_size); 
-        // if (pool == NULL) throw std::logic_error("could not create output pool");     
+        pool = mmal_port_pool_create(out, out->buffer_num, out->buffer_size); 
+        if (pool == NULL) throw std::logic_error("could not create output pool");     
+    }
+
+    bool enable() {
+        if (!Component::enable()) 
+            return false;
+
+        int num = mmal_queue_length(pool->queue);
+        for (int i = 0; i < num; i++) {
+            send_buffer();
+        }
+
+        return true;
+    }
+
+    bool send_buffer() {
+        MMAL_BUFFER_HEADER_T * buffer = mmal_queue_get(pool->queue);
+
+        if (!buffer) throw std::logic_error("could not get buffer from pool");
+
+        if(mmal_port_send_buffer(output(), buffer) != MMAL_SUCCESS) 
+            throw std::logic_error("could not send buffer to output port");
+
+        return true;
     }
 
     MMAL_PORT_T * input() { return comp->input[0]; }
@@ -306,6 +345,11 @@ private:
 
         std::cerr << "output callback" << std::endl;
         // mmal_queue_put(ctx->queue, buffer);
+
+        
+        mmal_buffer_header_release(buffer);
+        
+        ctx->video_encoder.send_buffer();
 
         ctx->ready.notify_all();
     }
@@ -386,6 +430,7 @@ public:
         camera_to_video_encoder->user_data = (void*)this;
         camera_to_video_encoder->callback = connection_callback;
 
+        video_encoder.output()->userdata = (struct MMAL_PORT_USERDATA_T*)this;
         status = mmal_port_enable(video_encoder.output(), output_callback);
         if (status != MMAL_SUCCESS) throw std::logic_error("could not enable encoder output port");
 
@@ -396,13 +441,14 @@ public:
     void start() { 
         std::cerr << "starting..." << std::endl;
 
+
+        auto camera_enabled = make_enabler(camera);
+        auto encder_enabled = make_enabler(video_encoder);
+        mmal_connection_enabled enabled(camera_to_video_encoder);
+
         MMAL_STATUS_T status;
         status = mmal_port_parameter_set_boolean(camera.video_port(), MMAL_PARAMETER_CAPTURE, true);
         if (status != MMAL_SUCCESS) std::logic_error("error starting capture");
-
-        mmal_connection_enabled enabled(camera_to_video_encoder);
-        auto camera_enabled = camera.enable_scoped();
-        auto encder_enabled = video_encoder.enable_scoped();
 
         while(processing_step()) { }
     }
